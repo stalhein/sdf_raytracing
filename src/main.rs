@@ -1,26 +1,105 @@
 
+mod camera;
+use crate::camera::Camera;
+use bytemuck::{Pod, Zeroable};
 use std::sync::Arc;
+use std::time::Instant;
 
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use wgpu::Instance;
 
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct CameraUniform {
+    position: [f32; 3],
+    _pad0: f32,
+    direction: [f32; 3],
+    _pad1: f32,
+}
+
 #[derive(Default)]
 struct App {
-    window: Option<Arc<Window>>,
+    camera: Camera,
+    last_frame: Option<Instant>,
+    is_cursor_grabbed: bool,
     surface: Option<wgpu::Surface<'static>>,
+    window: Option<Arc<Window>>,
     device: Option<wgpu::Device>,
     queue: Option<wgpu::Queue>,
     config: Option<wgpu::SurfaceConfiguration>,
     texture: Option<wgpu::Texture>,
     texture_view: Option<wgpu::TextureView>,
+    camera_buffer: Option<wgpu::Buffer>,
+    compute_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    display_bind_group_layout: Option<wgpu::BindGroupLayout>,
     compute_pipeline: Option<wgpu::ComputePipeline>,
     display_pipeline: Option<wgpu::RenderPipeline>,
     compute_bind_group: Option<wgpu::BindGroup>,
     display_bind_group: Option<wgpu::BindGroup>,
+}
+
+impl App {
+    fn create_texture_resources(&mut self) {
+        // Return if no device and config
+        let (device, config, camera_buffer) = match (&self.device, &self.config, &self.camera_buffer) {
+            (Some(d), Some(c), Some(cb)) => (d, c, cb),
+            _ => return,
+        };
+
+        let compute_layout = self.compute_bind_group_layout.as_ref().unwrap();
+        let display_layout = self.display_bind_group_layout.as_ref().unwrap();
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Compute Texture"),
+            size: wgpu::Extent3d {
+                width: config.width.max(1),
+                height: config.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Compute Bind Group"),
+            layout: compute_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let display_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Display Bind Group"),
+            layout: display_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&texture_view),
+            }],
+        });
+
+        self.texture = Some(texture);
+        self.texture_view = Some(texture_view);
+        self.compute_bind_group = Some(compute_bind_group);
+        self.display_bind_group = Some(display_bind_group);
+    }
 }
 
 impl ApplicationHandler for App {
@@ -29,7 +108,10 @@ impl ApplicationHandler for App {
             .create_window(Window::default_attributes())
             .expect("Failed to create window."));
 
-        let instance = Instance::default();
+        let instance = Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..Default::default()
+        });
 
         let surface = instance.create_surface(window.clone()).expect("Failed to create surface.");
 
@@ -71,41 +153,23 @@ impl ApplicationHandler for App {
         surface.configure(&device, &config);
 
 
-        // Compute
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Compute Texture"),
-            size: wgpu::Extent3d {
-                width: config.width,
-                height: config.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
+        // Camera
+        use wgpu::util::DeviceExt;
+        let camera_uniform = CameraUniform {
+            position: self.camera.position.to_array(),
+            _pad0: 0.0,
+            direction: self.camera.direction().to_array(),
+            _pad1: 0.0,
+        };
+
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Camera Uniform Buffer"),
+            contents: bytemuck::bytes_of(&camera_uniform),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let texture_view = texture.create_view(
-            &wgpu::TextureViewDescriptor::default()
-        );
 
-        let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Compute Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-        });
-
-        let display_shader = device.create_shader_module(
-            wgpu::ShaderModuleDescriptor {
-                label: Some("Display Shader"),
-                source: wgpu::ShaderSource::Wgsl(
-                    include_str!("display.wgsl").into()
-                ),
-            },
-        );
-
+        // Bind Groups
         let compute_bind_group_layout = 
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Compute Bind Group Layout"),
@@ -117,6 +181,16 @@ impl ApplicationHandler for App {
                             access: wgpu::StorageTextureAccess::WriteOnly,
                             format: wgpu::TextureFormat::Rgba8Unorm,
                             view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
                         count: None,
                     },
@@ -144,27 +218,21 @@ impl ApplicationHandler for App {
             },
         );
 
-        let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Compute Bind Group"),
-            layout: &compute_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&texture_view),
-                },
-            ],
+
+        // Pipelines
+        let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
 
-        let display_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Display Bind Group"),
-            layout: &display_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&texture_view),
-                },
-            ],
-        });
+        let display_shader = device.create_shader_module(
+            wgpu::ShaderModuleDescriptor {
+                label: Some("Display Shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("display.wgsl").into()
+                ),
+            },
+        );
 
         let compute_pipeline_layout = 
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -224,81 +292,30 @@ impl ApplicationHandler for App {
             },
         );
 
-        let mut encoder = device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor {
-                label: Some("Encoder"),
-            },
-        );
-
-        {
-            let mut compute_pass = 
-                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Compute Pass"),
-                    timestamp_writes: None,
-            });
-
-            compute_pass.set_pipeline(&compute_pipeline);
-            compute_pass.set_bind_group(0, &compute_bind_group, &[]);
-            compute_pass.dispatch_workgroups(
-                (config.width + 7) / 8,
-                (config.height + 7) / 8,
-                1,
-            );
-        }
-
-        let output = surface.get_current_texture().unwrap();
-        let output_view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        {
-            let mut render_pass = encoder.begin_render_pass(
-                &wgpu::RenderPassDescriptor {
-                    label: Some("Display Render Pass"),
-                    color_attachments: &[Some(
-                        wgpu::RenderPassColorAttachment {
-                            view: &output_view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        }
-                    )],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                }
-            );
-
-            render_pass.set_pipeline(&display_pipeline);
-            render_pass.set_bind_group(
-                0,
-                &display_bind_group,
-                &[]
-            );
-            render_pass.draw(0..3, 0..1);
-        }
-
-
-        let commands = encoder.finish();
-
-        queue.submit(Some(commands));
-
-        output.present();
-
-
+        let camera = Camera::new();
+        
+        self.camera = camera;
+        self.last_frame = Some(Instant::now());
+        self.is_cursor_grabbed = false;
         self.window = Some(window);
         self.surface = Some(surface);
         self.device = Some(device);
         self.queue = Some(queue);
         self.config = Some(config);
-        self.texture = Some(texture);
-        self.texture_view = Some(texture_view);
+        self.camera_buffer = Some(camera_buffer);
+        self.compute_bind_group_layout = Some(compute_bind_group_layout);
+        self.display_bind_group_layout = Some(display_bind_group_layout);
         self.compute_pipeline = Some(compute_pipeline);
         self.display_pipeline = Some(display_pipeline);
-        self.compute_bind_group = Some(compute_bind_group);
-        self.display_bind_group = Some(display_bind_group);
 
+        self.create_texture_resources();
+
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -312,8 +329,37 @@ impl ApplicationHandler for App {
     ) {
         match event {
             WindowEvent::CloseRequested => {
-                println!("Closing...");
                 event_loop.exit();
+            }
+            WindowEvent::MouseInput { state: winit::event::ElementState::Pressed,
+                                      button: winit::event::MouseButton::Left, .. } => {
+                if let Some(window) = &self.window {
+                    window.set_cursor_visible(false);
+                    let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Locked)
+                        .or_else(|_| window.set_cursor_grab(winit::window::CursorGrabMode::Confined));
+                    self.is_cursor_grabbed = true;
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                let is_pressed = event.state.is_pressed();
+
+                if event.physical_key == KeyCode::Escape && is_pressed {
+                    if let Some(window) = &self.window {
+                        window.set_cursor_visible(true);
+                        let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
+                        self.is_cursor_grabbed = false;
+                    }
+                }
+
+                match event.physical_key {
+                    PhysicalKey::Code(KeyCode::KeyW) => self.camera.move_forward = is_pressed,
+                    PhysicalKey::Code(KeyCode::KeyS) => self.camera.move_backward = is_pressed,
+                    PhysicalKey::Code(KeyCode::KeyA) => self.camera.move_left = is_pressed,
+                    PhysicalKey::Code(KeyCode::KeyD) => self.camera.move_right = is_pressed,
+                    PhysicalKey::Code(KeyCode::Space) => self.camera.move_up = is_pressed,
+                    PhysicalKey::Code(KeyCode::ShiftLeft) => self.camera.move_down = is_pressed,
+                    _ => {}
+                }
             }
             WindowEvent::Resized(size) => {
                 if size.width > 0 && size.height > 0 {
@@ -322,13 +368,125 @@ impl ApplicationHandler for App {
                     {
                         config.width = size.width;
                         config.height = size.height;
-
                         surface.configure(device, config);
+
+                        self.create_texture_resources();
                     }
                 }
             }
-            WindowEvent::RedrawRequested => {}
+            WindowEvent::RedrawRequested => {
+                // Update
+                let now = Instant::now();
+                if let Some(last) = self.last_frame {
+                    let dt = now.duration_since(last).as_secs_f32();
+                    self.camera.update(dt);
+                }
+                self.last_frame = Some(now);
+
+                if let (Some(queue), Some(camera_buffer)) = (&self.queue, &self.camera_buffer) {
+                    let camera_uniform = CameraUniform {
+                        position: self.camera.position.to_array(),
+                        _pad0: 0.0,
+                        direction: self.camera.direction().to_array(),
+                        _pad1: 0.0,
+                    };
+                    queue.write_buffer(camera_buffer, 0, bytemuck::bytes_of(&camera_uniform));
+                }
+
+                // Render
+                let (surface, device, queue, config, compute_pipeline, display_pipeline, compute_bind_group, display_bind_group) =
+                    match (&self.surface, &self.device, &self.queue, &self.config, &self.compute_pipeline,
+                            &self.display_pipeline, &self.compute_bind_group, &self.display_bind_group) {
+                    (
+                        Some(s),
+                        Some(d),
+                        Some(q),
+                        Some(c),
+                        Some(cp),
+                        Some(dp),
+                        Some(cbg),
+                        Some(dbg),
+                    ) => (s, d, q, c, cp, dp, cbg, dbg),
+                    _ => return,
+                };
+
+                let output = match surface.get_current_texture() {
+                    Ok(frame) => frame,
+                    Err(wgpu::SurfaceError::Outdated) => {
+                        surface.configure(device, config);
+                        return;
+                    }
+                    Err(wgpu::SurfaceError::Timeout) => return,
+                    Err(e) => {
+                        eprintln!("Surface error: {e:?}.");
+                        return;
+                    }
+                };
+
+                let output_view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Encoder") });
+
+                // Compute pass
+                {
+                    let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("Compute Pass"),
+                        timestamp_writes: None,
+                    });
+
+                    compute_pass.set_pipeline(compute_pipeline);
+                    compute_pass.set_bind_group(0, compute_bind_group, &[]);
+                    compute_pass.dispatch_workgroups(
+                        (config.width + 7) / 8,
+                        (config.height + 7) / 8,
+                        1,
+                    );
+                }
+
+                // Display pass 
+                {
+                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("Display Render Pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &output_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    
+                    render_pass.set_pipeline(display_pipeline);
+                    render_pass.set_bind_group(0, display_bind_group, &[]);
+                    render_pass.draw(0..3, 0..1);
+                }
+
+                queue.submit(Some(encoder.finish()));
+                output.present();
+
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }   
             _ => (),
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: winit::event::DeviceEvent,
+    ) {
+        if let winit::event::DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            if self.is_cursor_grabbed {
+                self.camera.process_mouse(dx, dy);
+            }
         }
     }
 }
