@@ -21,9 +21,9 @@ pub struct Camera {
 impl Camera {
     pub fn new() -> Self {
         Self {
-            position: glam::vec3(-2.0, 2.0, 0.0),
-            yaw: 0.0,
-            pitch: -0.3,
+            position: glam::vec3(-4.5, 2.0, -3.3),
+            yaw: 0.5,
+            pitch: -0.35,
             move_forward: false,
             move_backward: false,
             move_left: false,
